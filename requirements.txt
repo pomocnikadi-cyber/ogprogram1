@@ -4,3 +4,4 @@ plotly
 streamlit-option-menu
 qrcode
 pillow
+supabase
