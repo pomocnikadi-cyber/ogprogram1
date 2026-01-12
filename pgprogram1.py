@@ -4,25 +4,38 @@ import pandas as pd
 import plotly.express as px
 from streamlit_option_menu import option_menu
 import qrcode
-from PIL import Image
 from io import BytesIO
 from datetime import datetime
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="NexGen Warehouse", page_icon="🏢", layout="wide")
 
-# --- STYLE CSS (Nowoczesny wygląd) ---
+# --- STYLE CSS (Poprawione na jasny motyw) ---
+# Zmieniono kolory tła na białe/szare, a czcionkę na ciemną.
 st.markdown("""
     <style>
         .block-container {padding-top: 1rem; padding-bottom: 5rem;}
+        
+        /* Stylizacja kafelków KPI (Metrics) */
         div[data-testid="stMetric"] {
-            background-color: #262730;
-            border: 1px solid #464b5c;
+            background-color: #ffffff; /* Białe tło zamiast czarnego */
+            border: 1px solid #e6e6e6;
             padding: 15px;
             border-radius: 10px;
-            color: white;
+            color: #31333F; /* Ciemny tekst */
+            box-shadow: 0px 2px 4px rgba(0,0,0,0.05); /* Delikatny cień dla efektu 3D */
         }
-        div[data-testid="stMetricLabel"] {color: #b4c6e3;}
+        
+        /* Stylizacja etykiety wewnątrz metryki */
+        div[data-testid="stMetricLabel"] {
+            color: #6c757d; /* Szary kolor etykiety */
+            font-weight: bold;
+        }
+
+        /* Stylizacja wartości liczbowej */
+        div[data-testid="stMetricValue"] {
+            color: #000000; /* Czarny kolor liczby */
+        }
     </style>
 """, unsafe_allow_html=True)
 
@@ -35,7 +48,7 @@ def get_connection():
 conn = get_connection()
 cursor = conn.cursor()
 
-# Inicjalizacja tabel (Rozbudowana o Historię)
+# Inicjalizacja tabel
 cursor.execute('''CREATE TABLE IF NOT EXISTS Kategorie (id INTEGER PRIMARY KEY, nazwa TEXT)''')
 cursor.execute('''CREATE TABLE IF NOT EXISTS Produkty 
                   (id INTEGER PRIMARY KEY, nazwa TEXT, ilosc INTEGER, cena REAL, kategoria_id INTEGER, 
@@ -58,7 +71,7 @@ def generate_qr(data):
     img = qr.make_image(fill_color="black", back_color="white")
     return img
 
-# --- MENU BOCZNE (To wygląda lepiej niż zwykłe taby) ---
+# --- MENU BOCZNE ---
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/2897/2897785.png", width=50)
     st.title("NexGen WMS")
@@ -68,8 +81,14 @@ with st.sidebar:
         icons=["speedometer2", "box-seam", "arrow-left-right", "file-earmark-bar-graph", "plus-circle"],
         menu_icon="cast",
         default_index=0,
+        styles={
+            "container": {"padding": "0!important", "background-color": "#fafafa"},
+            "icon": {"color": "orange", "font-size": "20px"}, 
+            "nav-link": {"font-size": "16px", "text-align": "left", "margin":"0px", "--hover-color": "#eee"},
+            "nav-link-selected": {"background-color": "#ff4b4b"},
+        }
     )
-    st.info("System w wersji v2.1")
+    st.info("System w wersji v2.2 (Light)")
 
 # --- POBRANIE DANYCH ---
 df_prod = pd.read_sql_query('''
@@ -94,10 +113,18 @@ if selected == "Dashboard":
     # 2. Wykresy
     c1, c2 = st.columns([2, 1])
     with c1:
-        st.subheader("Struktura Wartości (Sunburst Chart)")
+        st.subheader("Struktura Wartości")
         if not df_prod.empty:
-            fig = px.sunburst(df_prod, path=['Kategoria', 'Produkt'], values='Wartość', 
-                              color='Wartość', color_continuous_scale='RdBu')
+            # POPRAWKA WYKRESU: Usunięcie mapowania koloru na wartość (co powodowało bladość)
+            # Teraz kolor zależy od Kategorii, co daje wyraźne odcięcie.
+            fig = px.sunburst(
+                df_prod, 
+                path=['Kategoria', 'Produkt'], 
+                values='Wartość', 
+                color='Kategoria', # Koloruj według kategorii, a nie wartości
+                color_discrete_sequence=px.colors.qualitative.Pastel # Ładna paleta kolorów
+            )
+            fig.update_layout(margin=dict(t=0, l=0, r=0, b=0))
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.warning("Brak danych do wykresu.")
@@ -110,9 +137,8 @@ if selected == "Dashboard":
 # ================= MAGAZYN (EDYCJA INLINE) =================
 elif selected == "Magazyn":
     st.header("📋 Pełny stan magazynowy (Edycja na żywo)")
-    st.caption("Kliknij dwukrotnie w komórkę tabeli, aby edytować dane (np. zmień cenę lub stan).")
+    st.caption("Kliknij dwukrotnie w komórkę tabeli, aby edytować dane.")
 
-    # Edytowalna tabela (Game Changer!)
     edited_df = st.data_editor(
         df_prod[['id', 'Produkt', 'Stan', 'Cena', 'Kategoria', 'min_stan', 'kod_sku']],
         key="editor",
@@ -121,14 +147,10 @@ elif selected == "Magazyn":
         use_container_width=True
     )
 
-    # Logika zapisu zmian (uproszczona dla demo)
     if st.button("💾 Zapisz zmiany w bazie"):
-        # Tutaj w pełnej aplikacji byłaby pętla aktualizująca rekordy
-        # Dla celów studenckich wystarczy symulacja lub update konkretnego pola
         st.success("Dane zsynchronizowane (Symulacja zapisu w tym trybie demo)!")
         st.balloons()
 
-    # Generowanie kodów QR dla wybranego produktu
     st.markdown("---")
     st.subheader("🖨️ Generator Etykiet QR")
     wybor_qr = st.selectbox("Wybierz produkt do etykiety:", df_prod['Produkt'])
@@ -141,7 +163,6 @@ elif selected == "Magazyn":
         img = generate_qr(info_str)
         
         with col_qr1:
-            # Konwersja obrazu do wyświetlenia
             buf = BytesIO()
             img.save(buf)
             st.image(buf, caption="Zeskanuj mnie!", width=150)
@@ -149,7 +170,7 @@ elif selected == "Magazyn":
         with col_qr2:
             st.info(f"**Dane w kodzie:**\n\n{info_str}")
 
-# ================= OPERACJE (PRZYJĘCIA/WYDANIA) =================
+# ================= OPERACJE =================
 elif selected == "Operacje":
     st.header("🔄 Przyjęcia i Wydania (WZ / PZ)")
     
@@ -163,7 +184,6 @@ elif selected == "Operacje":
     
     with col_op2:
         st.subheader("Rodzaj operacji")
-        # Pobranie aktualnego stanu
         if prod_op:
             curr_stock = df_prod[df_prod['Produkt'] == prod_op]['Stan'].values[0]
             st.metric("Aktualny stan", f"{curr_stock} szt.")
@@ -188,9 +208,7 @@ elif selected == "Operacje":
 
 # ================= RAPORTY =================
 elif selected == "Raporty":
-    st.header("📑 Historia Operacji i Logi")
-    
-    # Filtrowanie
+    st.header("📑 Historia Operacji")
     search_hist = st.text_input("Szukaj w historii (nazwa produktu, typ operacji)...")
     
     query_hist = "SELECT * FROM Historia ORDER BY id DESC"
@@ -201,8 +219,6 @@ elif selected == "Raporty":
                                 df_history['akcja'].str.contains(search_hist, case=False)]
     
     st.dataframe(df_history, use_container_width=True)
-    
-    # Export
     csv = df_history.to_csv(index=False).encode('utf-8')
     st.download_button("📥 Pobierz pełny raport (CSV)", csv, "historia_magazynu.csv", "text/csv")
 
@@ -220,10 +236,7 @@ elif selected == "Dodaj Nowy":
         n_cena = c4.number_input("Cena zakupu (PLN)", 0.0)
         n_min = c5.number_input("Alarm niskiego stanu (szt)", 5)
         
-        # Pobieranie kategorii
         cats = pd.read_sql_query("SELECT id, nazwa FROM Kategorie", conn)
-        
-        # Sekcja dodawania nowej kategorii "w locie"
         new_cat_txt = st.text_input("Lub wpisz nową kategorię (jeśli brak na liście)")
         
         selected_cat_id = None
