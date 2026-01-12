@@ -76,10 +76,9 @@ with st.sidebar:
             "nav-link-selected": {"background-color": "#ff4b4b"},
         }
     )
-    st.info("System w wersji v2.3 (Fix)")
+    st.info("System w wersji v2.4")
 
 # --- POBRANIE DANYCH ---
-# Pobieramy dane przy każdym odświeżeniu, aby mieć aktualny stan
 df_prod = pd.read_sql_query('''
     SELECT p.id, p.nazwa AS Produkt, p.ilosc AS Stan, p.cena AS Cena, k.nazwa AS Kategoria, p.min_stan, p.kod_sku
     FROM Produkty p LEFT JOIN Kategorie k ON p.kategoria_id = k.id
@@ -132,7 +131,6 @@ elif selected == "Magazyn":
         use_container_width=True
     )
     
-    # Tutaj w pełnej wersji należałoby dodać logikę zapisu zmian z data_editor do SQL
     if st.button("💾 Zapisz zmiany (Demo)"):
         st.success("W wersji demonstracyjnej edycja bezpośrednia tabeli nie zapisuje zmian w SQL (użyj Operacji lub Dodaj Nowy).")
 
@@ -141,7 +139,6 @@ elif selected == "Magazyn":
     wybor_qr = st.selectbox("Wybierz produkt:", df_prod['Produkt'].unique())
     
     if wybor_qr:
-        # Pobieramy pierwszy pasujący produkt (dla QR kodu duplikaty nie są krytyczne)
         row = df_prod[df_prod['Produkt'] == wybor_qr].iloc[0]
         col_qr1, col_qr2 = st.columns([1, 4])
         info_str = f"ID: {row['id']}\nProdukt: {row['Produkt']}\nCena: {row['Cena']} PLN\nSKU: {row['kod_sku']}"
@@ -153,7 +150,7 @@ elif selected == "Magazyn":
         with col_qr2:
             st.info(f"**Dane:**\n{info_str}")
 
-# ================= OPERACJE (POPRAWIONE) =================
+# ================= OPERACJE =================
 elif selected == "Operacje":
     st.header("🔄 Przyjęcia i Wydania")
     
@@ -162,9 +159,7 @@ elif selected == "Operacje":
     with col_op1:
         st.subheader("Wybierz towar")
         
-        # --- FIX: Tworzymy słownik { "Nazwa (ID: 1)" : 1 } aby odróżnić duplikaty ---
         product_map = {f"{row['Produkt']} (ID: {row['id']})": row['id'] for index, row in df_prod.iterrows()}
-        
         selected_label = st.selectbox("Produkt", options=list(product_map.keys()))
         
         selected_id = None
@@ -172,7 +167,6 @@ elif selected == "Operacje":
         
         if selected_label:
             selected_id = product_map[selected_label]
-            # Pobieramy nazwę do logów
             current_prod_name = df_prod[df_prod['id'] == selected_id]['Produkt'].values[0]
 
         ilosc_op = st.number_input("Ilość", min_value=1, step=1)
@@ -182,25 +176,20 @@ elif selected == "Operacje":
         st.subheader("Rodzaj operacji")
         
         if selected_id:
-            # Pobieramy stan konkretnego ID z bazy (nie z dataframe, żeby mieć pewność)
             curr_stock_val = cursor.execute("SELECT ilosc FROM Produkty WHERE id = ?", (selected_id,)).fetchone()[0]
             st.metric("Aktualny stan (wybranego ID)", f"{curr_stock_val} szt.")
         
             c_btn1, c_btn2 = st.columns(2)
             
-            # --- PRZYJĘCIE ---
             if c_btn1.button("📥 PRZYJĘCIE (+)", use_container_width=True, type="primary"):
-                # FIX: Aktualizujemy po ID, a nie po nazwie!
                 cursor.execute("UPDATE Produkty SET ilosc = ilosc + ? WHERE id = ?", (ilosc_op, selected_id))
                 log_action(current_prod_name, "PRZYJĘCIE", ilosc_op, opis_op)
                 conn.commit()
                 st.success(f"Zaktualizowano stan dla ID: {selected_id}")
                 st.rerun()
                 
-            # --- WYDANIE ---
             if c_btn2.button("📤 WYDANIE (-)", use_container_width=True):
                 if curr_stock_val >= ilosc_op:
-                    # FIX: Aktualizujemy po ID
                     cursor.execute("UPDATE Produkty SET ilosc = ilosc - ? WHERE id = ?", (ilosc_op, selected_id))
                     log_action(current_prod_name, "WYDANIE", ilosc_op, opis_op)
                     conn.commit()
@@ -223,7 +212,7 @@ elif selected == "Raporty":
     
     st.dataframe(df_history, use_container_width=True)
 
-# ================= DODAWANIE (ZABEZPIECZONE) =================
+# ================= DODAWANIE =================
 elif selected == "Dodaj Nowy":
     st.header("➕ Rejestracja nowego asortymentu")
     
@@ -248,15 +237,13 @@ elif selected == "Dodaj Nowy":
         submitted = st.form_submit_button("Zapisz w bazie")
         
         if submitted:
-            # FIX: Sprawdzamy czy produkt już istnieje
             exists = cursor.execute("SELECT id FROM Produkty WHERE nazwa = ?", (n_nazwa,)).fetchone()
             
             if exists:
-                st.error(f"BŁĄD: Produkt o nazwie '{n_nazwa}' już istnieje w bazie! Użyj zakładki 'Operacje' lub 'Magazyn' do edycji.")
+                st.error(f"BŁĄD: Produkt o nazwie '{n_nazwa}' już istnieje w bazie!")
             elif not n_nazwa:
                 st.error("Podaj nazwę produktu.")
             else:
-                # Dodawanie nowej kategorii
                 if new_cat_txt:
                     cursor.execute("INSERT INTO Kategorie (nazwa) VALUES (?)", (new_cat_txt,))
                     conn.commit()
@@ -270,4 +257,7 @@ elif selected == "Dodaj Nowy":
                     
                     log_action(n_nazwa, "UTWORZENIE", n_ilosc, "Inicjalizacja")
                     conn.commit()
-                    st.success(f"Dodano
+                    st.success(f"Dodano nowy produkt: {n_nazwa}")
+                    st.rerun()
+                else:
+                    st.error("Wybierz lub dodaj kategorię.")
