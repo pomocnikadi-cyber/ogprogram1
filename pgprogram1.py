@@ -1,11 +1,11 @@
 import streamlit as st
-import sqlite3
 import pandas as pd
 import plotly.express as px
 from streamlit_option_menu import option_menu
 import qrcode
 from io import BytesIO
 from datetime import datetime
+from supabase import create_client
 
 # --- KONFIGURACJA STRONY ---
 st.set_page_config(page_title="NexGen Warehouse", page_icon="🏢", layout="wide")
@@ -27,30 +27,30 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# --- BAZA DANYCH ---
+# --- POŁĄCZENIE Z SUPABASE ---
 @st.cache_resource
-def get_connection():
-    conn = sqlite3.connect('magazyn_pro.db', check_same_thread=False)
-    return conn
+def init_connection():
+    try:
+        url = st.secrets["SUPABASE_URL"]
+        key = st.secrets["SUPABASE_KEY"]
+        return create_client(url, key)
+    except Exception as e:
+        st.error("Brakuje sekretów w .streamlit/secrets.toml lub panelu Streamlit Cloud!")
+        st.stop()
 
-conn = get_connection()
-cursor = conn.cursor()
-
-# Inicjalizacja tabel
-cursor.execute('''CREATE TABLE IF NOT EXISTS Kategorie (id INTEGER PRIMARY KEY, nazwa TEXT)''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS Produkty 
-                  (id INTEGER PRIMARY KEY, nazwa TEXT, ilosc INTEGER, cena REAL, kategoria_id INTEGER, 
-                   min_stan INTEGER DEFAULT 5, kod_sku TEXT)''')
-cursor.execute('''CREATE TABLE IF NOT EXISTS Historia 
-                  (id INTEGER PRIMARY KEY, data TEXT, produkt TEXT, akcja TEXT, ilosc INTEGER, opis TEXT)''')
-conn.commit()
+supabase = init_connection()
 
 # --- FUNKCJE POMOCNICZE ---
 def log_action(produkt, akcja, ilosc, opis):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute("INSERT INTO Historia (data, produkt, akcja, ilosc, opis) VALUES (?, ?, ?, ?, ?)",
-                   (now, produkt, akcja, ilosc, opis))
-    conn.commit()
+    data = {
+        "data": now,
+        "produkt": produkt,
+        "akcja": akcja,
+        "ilosc": int(ilosc),
+        "opis": opis
+    }
+    supabase.table("Historia").insert(data).execute()
 
 def generate_qr(data):
     qr = qrcode.QRCode(version=1, box_size=10, border=5)
@@ -76,31 +76,54 @@ with st.sidebar:
             "nav-link-selected": {"background-color": "#ff4b4b"},
         }
     )
-    st.info("System w wersji v2.4")
+    st.info("System w wersji v2.4 (Cloud)")
 
-# --- POBRANIE DANYCH ---
-df_prod = pd.read_sql_query('''
-    SELECT p.id, p.nazwa AS Produkt, p.ilosc AS Stan, p.cena AS Cena, k.nazwa AS Kategoria, p.min_stan, p.kod_sku
-    FROM Produkty p LEFT JOIN Kategorie k ON p.kategoria_id = k.id
-''', conn)
-df_prod['Wartość'] = df_prod['Stan'] * df_prod['Cena']
+# --- POBRANIE DANYCH (SUPABASE) ---
+# Pobieramy produkty
+resp_prod = supabase.table("Produkty").select("*").execute()
+df_prod_raw = pd.DataFrame(resp_prod.data)
+
+# Pobieramy kategorie
+resp_cat = supabase.table("Kategorie").select("*").execute()
+df_cat = pd.DataFrame(resp_cat.data)
+
+# Łączenie danych (zamiast SQL JOIN robimy to w Pandas)
+if not df_prod_raw.empty:
+    if not df_cat.empty:
+        # Zmieniamy nazwę kolumny id w kategoriach, żeby się nie gryzła
+        df_cat_renamed = df_cat.rename(columns={"id": "cat_id_ref", "nazwa": "Kategoria"})
+        df_prod = pd.merge(df_prod_raw, df_cat_renamed, left_on="kategoria_id", right_on="cat_id_ref", how="left")
+    else:
+        df_prod = df_prod_raw
+        df_prod["Kategoria"] = "Brak"
+    
+    # Formatowanie kolumn do wyświetlania
+    df_prod['Wartość'] = df_prod['ilosc'] * df_prod['cena']
+    df_prod = df_prod.rename(columns={"nazwa": "Produkt", "ilosc": "Stan", "cena": "Cena"})
+else:
+    df_prod = pd.DataFrame(columns=["id", "Produkt", "Stan", "Cena", "Kategoria", "min_stan", "kod_sku", "Wartość"])
 
 # ================= DASHBOARD =================
 if selected == "Dashboard":
     st.header(f"Witaj! Przegląd magazynu")
     
     col1, col2, col3, col4 = st.columns(4)
-    col1.metric("📦 Łącznie Produktów", f"{df_prod['Stan'].sum()} szt")
-    col2.metric("💰 Wartość Magazynu", f"{df_prod['Wartość'].sum():,.2f} PLN")
-    col3.metric("📉 Niskie Stany", f"{len(df_prod[df_prod['Stan'] <= df_prod['min_stan']])}")
-    col4.metric("📂 Kategorie", f"{df_prod['Kategoria'].nunique()}")
+    total_items = df_prod['Stan'].sum() if not df_prod.empty else 0
+    total_value = df_prod['Wartość'].sum() if not df_prod.empty else 0
+    low_stock = len(df_prod[df_prod['Stan'] <= df_prod['min_stan']]) if not df_prod.empty else 0
+    total_cats = df_prod['Kategoria'].nunique() if 'Kategoria' in df_prod.columns else 0
+
+    col1.metric("📦 Łącznie Produktów", f"{total_items} szt")
+    col2.metric("💰 Wartość Magazynu", f"{total_value:,.2f} PLN")
+    col3.metric("📉 Niskie Stany", f"{low_stock}")
+    col4.metric("📂 Kategorie", f"{total_cats}")
 
     st.markdown("---")
 
     c1, c2 = st.columns([2, 1])
     with c1:
         st.subheader("Struktura Wartości")
-        if not df_prod.empty:
+        if not df_prod.empty and 'Kategoria' in df_prod.columns:
             fig = px.sunburst(
                 df_prod, 
                 path=['Kategoria', 'Produkt'], 
@@ -115,28 +138,29 @@ if selected == "Dashboard":
     
     with c2:
         st.subheader("Ostatnie operacje")
-        df_hist = pd.read_sql_query("SELECT data, produkt, akcja, ilosc FROM Historia ORDER BY id DESC LIMIT 5", conn)
+        resp_hist = supabase.table("Historia").select("data, produkt, akcja, ilosc").order("id", desc=True).limit(5).execute()
+        df_hist = pd.DataFrame(resp_hist.data)
         st.dataframe(df_hist, use_container_width=True, hide_index=True)
 
 # ================= MAGAZYN =================
 elif selected == "Magazyn":
     st.header("📋 Pełny stan magazynowy")
-    st.caption("Kliknij dwukrotnie w komórkę tabeli, aby edytować dane.")
+    st.caption("Edycja bezpośrednia w tabeli nie jest obsługiwana w tym widoku (użyj Operacji).")
 
-    edited_df = st.data_editor(
-        df_prod[['id', 'Produkt', 'Stan', 'Cena', 'Kategoria', 'min_stan', 'kod_sku']],
-        key="editor",
-        num_rows="dynamic",
-        disabled=["id", "Wartość"],
-        use_container_width=True
-    )
-    
-    if st.button("💾 Zapisz zmiany (Demo)"):
-        st.success("W wersji demonstracyjnej edycja bezpośrednia tabeli nie zapisuje zmian w SQL (użyj Operacji lub Dodaj Nowy).")
+    if not df_prod.empty:
+        st.dataframe(
+            df_prod[['id', 'Produkt', 'Stan', 'Cena', 'Kategoria', 'min_stan', 'kod_sku']],
+            use_container_width=True,
+            hide_index=True
+        )
+    else:
+        st.info("Magazyn jest pusty.")
 
     st.markdown("---")
     st.subheader("🖨️ Generator Etykiet QR")
-    wybor_qr = st.selectbox("Wybierz produkt:", df_prod['Produkt'].unique())
+    
+    opcje = df_prod['Produkt'].unique() if not df_prod.empty else []
+    wybor_qr = st.selectbox("Wybierz produkt:", opcje)
     
     if wybor_qr:
         row = df_prod[df_prod['Produkt'] == wybor_qr].iloc[0]
@@ -159,7 +183,7 @@ elif selected == "Operacje":
     with col_op1:
         st.subheader("Wybierz towar")
         
-        product_map = {f"{row['Produkt']} (ID: {row['id']})": row['id'] for index, row in df_prod.iterrows()}
+        product_map = {f"{row['Produkt']} (ID: {row['id']})": row['id'] for index, row in df_prod.iterrows()} if not df_prod.empty else {}
         selected_label = st.selectbox("Produkt", options=list(product_map.keys()))
         
         selected_id = None
@@ -176,23 +200,26 @@ elif selected == "Operacje":
         st.subheader("Rodzaj operacji")
         
         if selected_id:
-            curr_stock_val = cursor.execute("SELECT ilosc FROM Produkty WHERE id = ?", (selected_id,)).fetchone()[0]
-            st.metric("Aktualny stan (wybranego ID)", f"{curr_stock_val} szt.")
-        
+            # Pobieramy aktualny stan bezpośrednio z bazy, aby uniknąć błędów
+            curr_stock_resp = supabase.table("Produkty").select("ilosc").eq("id", selected_id).execute()
+            curr_stock_val = curr_stock_resp.data[0]['ilosc']
+            
+            st.metric("Aktualny stan (Baza)", f"{curr_stock_val} szt.")
+            
             c_btn1, c_btn2 = st.columns(2)
             
             if c_btn1.button("📥 PRZYJĘCIE (+)", use_container_width=True, type="primary"):
-                cursor.execute("UPDATE Produkty SET ilosc = ilosc + ? WHERE id = ?", (ilosc_op, selected_id))
+                new_ilosc = int(curr_stock_val + ilosc_op)
+                supabase.table("Produkty").update({"ilosc": new_ilosc}).eq("id", selected_id).execute()
                 log_action(current_prod_name, "PRZYJĘCIE", ilosc_op, opis_op)
-                conn.commit()
                 st.success(f"Zaktualizowano stan dla ID: {selected_id}")
                 st.rerun()
                 
             if c_btn2.button("📤 WYDANIE (-)", use_container_width=True):
                 if curr_stock_val >= ilosc_op:
-                    cursor.execute("UPDATE Produkty SET ilosc = ilosc - ? WHERE id = ?", (ilosc_op, selected_id))
+                    new_ilosc = int(curr_stock_val - ilosc_op)
+                    supabase.table("Produkty").update({"ilosc": new_ilosc}).eq("id", selected_id).execute()
                     log_action(current_prod_name, "WYDANIE", ilosc_op, opis_op)
-                    conn.commit()
                     st.warning(f"Wydano towar z ID: {selected_id}")
                     st.rerun()
                 else:
@@ -203,14 +230,16 @@ elif selected == "Raporty":
     st.header("📑 Historia Operacji")
     search_hist = st.text_input("Szukaj...", placeholder="Nazwa produktu...")
     
-    query_hist = "SELECT * FROM Historia ORDER BY id DESC"
-    df_history = pd.read_sql_query(query_hist, conn)
+    resp_h = supabase.table("Historia").select("*").order("id", desc=True).execute()
+    df_history = pd.DataFrame(resp_h.data)
     
-    if search_hist:
-        df_history = df_history[df_history['produkt'].str.contains(search_hist, case=False) | 
-                                df_history['akcja'].str.contains(search_hist, case=False)]
-    
-    st.dataframe(df_history, use_container_width=True)
+    if not df_history.empty:
+        if search_hist:
+            df_history = df_history[df_history['produkt'].str.contains(search_hist, case=False) | 
+                                    df_history['akcja'].str.contains(search_hist, case=False)]
+        st.dataframe(df_history, use_container_width=True)
+    else:
+        st.info("Brak historii operacji.")
 
 # ================= DODAWANIE =================
 elif selected == "Dodaj Nowy":
@@ -226,38 +255,52 @@ elif selected == "Dodaj Nowy":
         n_cena = c4.number_input("Cena (PLN)", 0.0)
         n_min = c5.number_input("Min. stan", 5)
         
-        cats = pd.read_sql_query("SELECT id, nazwa FROM Kategorie", conn)
-        new_cat_txt = st.text_input("Nowa kategoria (opcjonalnie)")
+        # Pobierz kategorie do listy
+        cats_resp = supabase.table("Kategorie").select("*").execute()
+        cats_df = pd.DataFrame(cats_resp.data)
         
-        selected_cat_id = None
-        if not cats.empty:
-            cat_name = st.selectbox("Wybierz kategorię", cats['nazwa'])
-            selected_cat_id = cats[cats['nazwa'] == cat_name]['id'].values[0]
+        cat_names = cats_df['nazwa'].tolist() if not cats_df.empty else []
+        new_cat_txt = st.text_input("Nowa kategoria (jeśli nie ma na liście)")
+        
+        selected_cat_name = st.selectbox("Wybierz istniejącą kategorię", ["-- Wybierz --"] + cat_names)
         
         submitted = st.form_submit_button("Zapisz w bazie")
         
         if submitted:
-            exists = cursor.execute("SELECT id FROM Produkty WHERE nazwa = ?", (n_nazwa,)).fetchone()
+            # Sprawdź czy produkt istnieje
+            exists_resp = supabase.table("Produkty").select("id").eq("nazwa", n_nazwa).execute()
             
-            if exists:
+            if exists_resp.data:
                 st.error(f"BŁĄD: Produkt o nazwie '{n_nazwa}' już istnieje w bazie!")
             elif not n_nazwa:
                 st.error("Podaj nazwę produktu.")
             else:
-                if new_cat_txt:
-                    cursor.execute("INSERT INTO Kategorie (nazwa) VALUES (?)", (new_cat_txt,))
-                    conn.commit()
-                    selected_cat_id = cursor.lastrowid
+                final_cat_id = None
                 
-                if selected_cat_id:
-                    cursor.execute("""
-                        INSERT INTO Produkty (nazwa, ilosc, cena, kategoria_id, min_stan, kod_sku) 
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """, (n_nazwa, n_ilosc, n_cena, selected_cat_id, n_min, n_sku))
+                # Obsługa kategorii
+                if new_cat_txt:
+                    # Dodaj nową kategorię
+                    cat_ins = supabase.table("Kategorie").insert({"nazwa": new_cat_txt}).execute()
+                    # Supabase zwraca wstawiony wiersz, bierzemy ID
+                    final_cat_id = cat_ins.data[0]['id']
+                elif selected_cat_name != "-- Wybierz --":
+                    # Znajdź ID wybranej kategorii
+                    final_cat_id = cats_df[cats_df['nazwa'] == selected_cat_name]['id'].values[0]
+                
+                if final_cat_id:
+                    # Dodaj produkt
+                    new_prod_data = {
+                        "nazwa": n_nazwa,
+                        "ilosc": n_ilosc,
+                        "cena": n_cena,
+                        "kategoria_id": int(final_cat_id),
+                        "min_stan": n_min,
+                        "kod_sku": n_sku
+                    }
+                    supabase.table("Produkty").insert(new_prod_data).execute()
                     
                     log_action(n_nazwa, "UTWORZENIE", n_ilosc, "Inicjalizacja")
-                    conn.commit()
                     st.success(f"Dodano nowy produkt: {n_nazwa}")
                     st.rerun()
                 else:
-                    st.error("Wybierz lub dodaj kategorię.")
+                    st.error("Musisz wybrać kategorię z listy lub wpisać nową.")
